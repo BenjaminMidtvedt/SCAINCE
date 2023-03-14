@@ -7,7 +7,7 @@ import torchvision.models as models
 from torchvision.models.detection import rpn, anchor_utils, transform, backbone_utils
 from torchvision import ops
 
-models.detection.FasterRCNN
+from .autoencoders import AutoEncoder
 
 
 class RPAE(pl.LightningModule):
@@ -62,6 +62,16 @@ class RPAE(pl.LightningModule):
             rpn_post_nms_top_n,
             rpn_nms_thresh,
             score_thresh=rpn_score_thresh,
+        )
+
+        self.background_autoencoder = AutoEncoder(
+            input_shape=(3, 64, 64),
+            latent_dim=256,
+        )
+
+        self.feature_autoencoder = AutoEncoder(
+            input_shape=(3, 32, 32),
+            latent_dim=256,
         )
 
         self.transform = transform.GeneralizedRCNNTransform(
@@ -123,66 +133,121 @@ class RPAE(pl.LightningModule):
         images = images.float()
         boxes, scores = self(images)
 
-        n_reconstruct = [1, 10, 50, 100]
-        losses = {f"loss_top_{n}": 0.0 for n in n_reconstruct}
+        # resize image to 64x64
+        small_images = F.interpolate(
+            images, size=(64, 64), mode="bilinear", align_corners=False
+        )
+        autoencoder_output = self.background_autoencoder(small_images)
+
+        feature_autoencoder_input = ops.roi_align(
+            images,
+            boxes,
+            output_size=(32, 32),
+            spatial_scale=1.0,
+        )
+        boxes_per_image = [len(box) for box in boxes]
+        feature_autoencoder_output = self.feature_autoencoder(feature_autoencoder_input)
+
+        # get list of features for each image
+        feature_autoencoder_output_list = []
+        start = 0
+        for boxes_per_image in boxes_per_image:
+            end = start + boxes_per_image
+            feature_autoencoder_output_list.append(
+                torch.abs(
+                    feature_autoencoder_output[start:end]
+                    - feature_autoencoder_input[start:end]
+                )
+            )
+            start = end
+
+        # restored background image
+        background = F.interpolate(
+            autoencoder_output,
+            size=(images.shape[2], images.shape[3]),
+            mode="bilinear",
+            align_corners=False,
+        ).detach()
+
+        bg_error = torch.abs(images - background)
+
+        loss = 0
+        weighted_error = 0
+        weighted_score = 0
+        weighted_potential_improvement = 0
 
         for batch_idx in range(images.shape[0]):
 
-            image = images[batch_idx : batch_idx + 1]
-            pooled_boxes = ops.roi_align(
-                images[batch_idx : batch_idx + 1],
+            error = bg_error[batch_idx : batch_idx + 1]
+            error_density_in_box = ops.roi_align(
+                error,
                 boxes[batch_idx : batch_idx + 1],
-                output_size=(28, 28),
+                output_size=(1, 1),
                 spatial_scale=1.0,
+            ).mean((1, 2, 3))
+
+            error_mass_in_box = error_density_in_box * ops.boxes.box_area(
+                boxes[batch_idx]
             )
 
-            reconstructed_images = torch.zeros_like(image).to(image.device)
-            image_weights = torch.zeros_like(image).to(image.device) + 1e-8
-            for i in range(boxes[batch_idx].shape[0]):
+            feature_encoder_error = feature_autoencoder_output_list[batch_idx]
+            feature_encoder_error = feature_encoder_error.mean((1, 2, 3))
 
-                box = boxes[batch_idx][i]
-                pooled_box = pooled_boxes[i]
-                scale_x = 256 / (box[2] - box[0])
-                scale_y = 256 / (box[3] - box[1])
-                half_box_width = (box[2] - box[0]) / 2
-                half_box_height = (box[3] - box[1]) / 2
-                translate_x = -((box[0] + half_box_width) / 128 - 1) * scale_x
-                translate_y = -((box[1] + half_box_height) / 128 - 1) * scale_y
-                scale_and_translate = torch.Tensor(
-                    [
-                        [scale_x, 0, translate_x],
-                        [0, scale_y, translate_y],
-                    ]
-                ).to(image.device)
+            # high values mean that the autoencoder improved the image
+            # low values mean that the autoencoder did not improve the image
+            improved_error_in_box = (
+                error_density_in_box - feature_encoder_error
+            ).detach()
 
-                grid = F.affine_grid(scale_and_translate[None], image.shape)
-                resized_box = F.grid_sample(pooled_box[None], grid)[0]
+            # weighted sum of improved error and score
+            # This should force the model to put a high score on boxes that it thinks will improve the image
+            # and a low score on boxes that it thinks will not improve the image
+            _weighted_score = (scores[batch_idx] * improved_error_in_box).view(
+                -1
+            ).sum() / (scores[batch_idx].view(-1).sum() + 1e-8)
 
-                where_box = resized_box != 0
-                # Add the resized box to the image
-                reconstructed_images = (
-                    reconstructed_images + resized_box[None] * scores[batch_idx][i]
-                )
-                image_weights = image_weights + where_box[None] * scores[batch_idx][i]
+            # potential improvement to the image
+            _weighted_potential_improvement = (
+                error_mass_in_box * scores[batch_idx]
+            ).view(-1).sum() / (scores[batch_idx].view(-1).sum() + 1e-8)
+            # print(error_mass_in_box, scores[batch_idx])
 
-                if i + 1 in n_reconstruct:
-                    losses[f"loss_top_{i + 1}"] = losses[
-                        f"loss_top_{i + 1}"
-                    ] + F.mse_loss(
-                        reconstructed_images / image_weights,
-                        images[batch_idx : batch_idx + 1],
-                    )
+            # weighted sum of feature encoder error and error mass
+            # This should force the autoencoder to focus its learning on the areas of the image
+            # with high error mass
+            # The error mass is detached from the graph to avoid backpropagating through the
+            # region proposal network
+            detached_error_mass_in_box = error_density_in_box.detach()
+            _weighted_error = (detached_error_mass_in_box * feature_encoder_error).view(
+                -1
+            ).sum() / (detached_error_mass_in_box.view(-1).sum() + 1e-8)
 
-        loss = 0
-        for idx, l in enumerate(losses.values()):
-            if idx == 0:
-                loss += l * 0.1
-            else:
-                loss += l
-        losses["loss"] = loss
+            # combine the two losses.
+            # Weighted score should be maximized
+            # Weighted error should be minimized
+            weighted_error += _weighted_error
+            weighted_score += _weighted_score
+            weighted_potential_improvement += _weighted_potential_improvement
 
-        self.log_dict(losses, on_step=True)
+        weighted_error = weighted_error / images.shape[0]
+        weighted_score = weighted_score / images.shape[0]
+        weighted_potential_improvement = (
+            weighted_potential_improvement / images.shape[0]
+        )
 
+        loss = weighted_error - weighted_score
+
+        losses = {
+            "loss": loss,
+        }
+
+        metrics = {
+            "weighted_error": weighted_error,
+            "weighted_score": weighted_score,
+            "weighted_potential_improvement": weighted_potential_improvement,
+        }
+
+        self.log_dict(metrics, on_step=True, prog_bar=True)
         return losses
 
     def configure_optimizers(self):

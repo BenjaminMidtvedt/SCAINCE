@@ -4,9 +4,10 @@ import torch.nn.functional as F
 
 from torch.autograd import Variable
 
-import common
+from . import common
 
 import numpy as np
+import pytorch_lightning as pl
 
 
 class CNN_Encoder(nn.Module):
@@ -19,9 +20,9 @@ class CNN_Encoder(nn.Module):
         # convolutions
         self.conv = nn.Sequential(
             nn.Conv2d(
-                in_channels=1,
+                in_channels=self.input_size[0],
                 out_channels=self.channel_mult * 1,
-                kernel_size=4,
+                kernel_size=3,
                 stride=1,
                 padding=1,
             ),
@@ -35,7 +36,7 @@ class CNN_Encoder(nn.Module):
             nn.Conv2d(self.channel_mult * 4, self.channel_mult * 8, 4, 2, 1),
             nn.BatchNorm2d(self.channel_mult * 8),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(self.channel_mult * 8, self.channel_mult * 16, 3, 2, 1),
+            nn.Conv2d(self.channel_mult * 8, self.channel_mult * 16, 4, 2, 1),
             nn.BatchNorm2d(self.channel_mult * 16),
             nn.LeakyReLU(0.2, inplace=True),
         )
@@ -59,14 +60,14 @@ class CNN_Encoder(nn.Module):
 
 
 class CNN_Decoder(nn.Module):
-    def __init__(self, embedding_size, input_size=(1, 28, 28)):
+    def __init__(self, embedding_size, flat_fts, base_width, base_height):
         super(CNN_Decoder, self).__init__()
-        self.input_height = 28
-        self.input_width = 28
         self.input_dim = embedding_size
         self.channel_mult = 16
-        self.output_channels = 1
-        self.fc_output_dim = 512
+        self.output_channels = 3
+        self.fc_output_dim = flat_fts // 2
+        self.base_width = base_width
+        self.base_height = base_height
 
         self.fc = nn.Sequential(
             nn.Linear(self.input_dim, self.fc_output_dim),
@@ -74,47 +75,52 @@ class CNN_Decoder(nn.Module):
             nn.ReLU(True),
         )
 
+        self.deflatten = nn.Sequential(
+            nn.Unflatten(1, (self.channel_mult * 8, self.base_width, self.base_height))
+        )
+
         self.deconv = nn.Sequential(
-            # input is Z, going into a convolution
             nn.ConvTranspose2d(
-                self.fc_output_dim, self.channel_mult * 4, 4, 1, 0, bias=False
+                self.channel_mult * 8, self.channel_mult * 4, 4, 2, 1, bias=False
             ),
             nn.BatchNorm2d(self.channel_mult * 4),
             nn.ReLU(True),
-            # state size. self.channel_mult*32 x 4 x 4
             nn.ConvTranspose2d(
-                self.channel_mult * 4, self.channel_mult * 2, 3, 2, 1, bias=False
+                self.channel_mult * 4, self.channel_mult * 2, 4, 2, 1, bias=False
             ),
             nn.BatchNorm2d(self.channel_mult * 2),
             nn.ReLU(True),
-            # state size. self.channel_mult*16 x 7 x 7
             nn.ConvTranspose2d(
                 self.channel_mult * 2, self.channel_mult * 1, 4, 2, 1, bias=False
             ),
             nn.BatchNorm2d(self.channel_mult * 1),
             nn.ReLU(True),
-            # state size. self.channel_mult*8 x 14 x 14
             nn.ConvTranspose2d(
                 self.channel_mult * 1, self.output_channels, 4, 2, 1, bias=False
             ),
-            nn.Sigmoid()
-            # state size. self.output_channels x 28 x 28
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
         x = self.fc(x)
-        x = x.view(-1, self.fc_output_dim, 1, 1)
+        x = self.deflatten(x)
         x = self.deconv(x)
-        return x.view(-1, self.input_width * self.input_height)
+        return x
 
 
-class AutoEncoder(nn.Module):
+class AutoEncoder(pl.LightningModule):
     def __init__(self, input_shape, latent_dim=64):
         super(AutoEncoder, self).__init__()
         self.input_shape = input_shape
         self.latent_dim = latent_dim
         self.encoder = CNN_Encoder(latent_dim, input_shape)
-        self.decoder = CNN_Decoder(latent_dim, input_shape)
+
+        _tensor = torch.rand(1, *input_shape)
+        _conv_out = self.encoder.conv(_tensor)
+        print(_conv_out.shape)
+        self.decoder = CNN_Decoder(
+            latent_dim, self.encoder.flat_fts, _conv_out.shape[2], _conv_out.shape[3]
+        )
 
     def encode(self, x):
         return self.encoder(x)
@@ -124,3 +130,11 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x):
         return self.decode(self.encode(x))
+
+    def training_step(self, batch, batch_idx):
+        x_hat = self(batch)
+        loss = F.l1_loss(x_hat, batch)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-3)
